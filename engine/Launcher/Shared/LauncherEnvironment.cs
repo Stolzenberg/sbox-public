@@ -1,4 +1,7 @@
 ﻿using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -59,7 +62,65 @@ public static class LauncherEnvironment
 			System.Environment.SetEnvironmentVariable( "FACEPUNCH_ENGINE", GamePath, EnvironmentVariableTarget.User );
 		}
 
+		EnsureNativeLibraryPrecedence( nativeDllPath );
+
 		UpdateNativeDllPath( nativeDllPath );
+	}
+
+	private const string PreloadGuardVariable = "SBOX_LINUX_PRELOAD";
+
+	private static void EnsureNativeLibraryPrecedence( string nativeDllPath )
+	{
+		if ( !OperatingSystem.IsLinux() ) return;
+
+		// Set by the child below - without this the re-exec would recurse forever.
+		if ( Environment.GetEnvironmentVariable( PreloadGuardVariable ) == "1" ) return;
+
+		var bundled = Path.Combine( nativeDllPath, "libHarfBuzzSharp.so" );
+		if ( !File.Exists( bundled ) ) return;
+
+		var existing = Environment.GetEnvironmentVariable( "LD_PRELOAD" );
+
+		// A wrapper script or Steam launch option already did this.
+		if ( existing is not null && existing.Contains( bundled, StringComparison.Ordinal ) ) return;
+
+		var executable = Environment.ProcessPath;
+		if ( string.IsNullOrEmpty( executable ) ) return;
+
+		var info = new ProcessStartInfo( executable )
+		{
+			UseShellExecute = false,
+			WorkingDirectory = Environment.CurrentDirectory
+		};
+
+		foreach ( var argument in Environment.GetCommandLineArgs().Skip( 1 ) )
+		{
+			info.ArgumentList.Add( argument );
+		}
+
+		info.Environment["LD_PRELOAD"] = string.IsNullOrEmpty( existing ) ? bundled : $"{bundled}:{existing}";
+		info.Environment[PreloadGuardVariable] = "1";
+
+		// Only xcb ships in qt5_plugins/platforms, so a Wayland session has to go through XWayland.
+		if ( string.IsNullOrEmpty( Environment.GetEnvironmentVariable( "QT_QPA_PLATFORM" ) ) )
+		{
+			info.Environment["QT_QPA_PLATFORM"] = "xcb";
+		}
+
+		try
+		{
+			using var child = Process.Start( info );
+			if ( child is null ) return;
+		}
+		catch ( Exception e )
+		{
+			// Carry on in this process rather than failing to start at all - it may still work if the
+			// host harfbuzz happens to be close enough to the vendored one.
+			Console.Error.WriteLine( $"Could not re-exec with LD_PRELOAD, continuing without it: {e.Message}" );
+			return;
+		}
+
+		Environment.Exit( 0 );
 	}
 
 	private static void UpdateNativeDllPath( string nativeDllPath )
